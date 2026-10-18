@@ -1,0 +1,26 @@
+# XcodeGen 备用工程定义（本目录已包含生成好的 SafeBaiyun.xcodeproj，一般无需使用）
+# 如需在 Mac 上重新生成： brew install xcodegen && xcodegen
+name: SafeBaiyun
+options:
+  bundleIdPrefix: com.safebaiyun
+  deploymentTarget:
+    iOS: "15.0"
+targets:
+  SafeBaiyun:
+    type: application
+    platform: iOS
+    deploymentTarget: "15.0"
+    sources:
+      - path: SafeBaiyun
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.safebaiyun.app
+        INFOPLIST_FILE: SafeBaiyun/Info.plist
+        GENERATE_INFOPLIST_FILE: NO
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
+        TARGETED_DEVICE_FAMILY: "1"
+        CODE_SIGN_STYLE: Automatic
+        SWIFT_VERSION: "5.0"
+        MARKETING_VERSION: "1.0"
+        CURRENT_PROJECT_VERSION: "1"
