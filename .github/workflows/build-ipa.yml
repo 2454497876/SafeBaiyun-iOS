@@ -1,0 +1,31 @@
+name: Build IPA
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Show Xcode version & targets
+        run: |
+          xcodebuild -version
+          xcodebuild -list -project SafeBaiyun.xcodeproj
+      - name: Build (unsigned, Release)
+        run: |
+          xcodebuild -project SafeBaiyun.xcodeproj -scheme SafeBaiyun \
+            -configuration Release -destination 'generic/platform=iOS' \
+            -derivedDataPath build CODE_SIGNING_ALLOWED=NO build
+      - name: Package IPA
+        run: |
+          mkdir -p Payload
+          cp -R build/Build/Products/Release-iphoneos/SafeBaiyun.app Payload/
+          zip -r SafeBaiyun-unsigned.ipa Payload
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: SafeBaiyun-ipa
+          path: SafeBaiyun-unsigned.ipa
+          if-no-files-found: error
