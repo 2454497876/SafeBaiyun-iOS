@@ -27,8 +27,13 @@ struct ContentView: View {
                 .disabled(manager.isAutoUnlocking || mac.isEmpty || key.isEmpty)
 
                 if manager.isAutoUnlocking {
-                    ProgressView("自动开门中：扫描并识别门禁…")
+                    ProgressView("自动开门中：识别并连接门禁…")
                 }
+
+                Text("首次开门会自动识别并记住门禁，之后秒级直连")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
 
                 if !manager.devices.isEmpty {
                     Text("扫描到的设备（自动识别失败时可手动点选）")
