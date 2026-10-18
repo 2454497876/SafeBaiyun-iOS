@@ -1,18 +1,28 @@
 import CoreBluetooth
 import SwiftUI
 
-/// 蓝牙开锁流程，对应 Android 版 `UnlockRepo.kt`，并增加"自动开门"模式。
+/// 蓝牙开锁流程，对应 Android 版 `UnlockRepo.kt`，并实现"快速自动开门"。
 ///
-/// iOS 与 Android 的一个关键差异：iOS 出于隐私保护**不向 App 暴露外设的 MAC 地址**，
-/// 无法像 Android 那样按 MAC 直接连接。因此本 App 采用：
-/// - **自动模式（默认）**：扫描后按信号强弱自动逐个尝试，谁带门禁服务就自动开锁，无需手动选设备
-/// - **手动模式（备用）**：设备列表点选（用于自动模式异常时排查）
+/// 提速方案（参考 BaiyunKeys 微信小程序的快速开锁机制）：
+/// 1. **缓存设备直连**：记住上次开门成功的设备 UUID，下次跳过扫描直接连接（秒开）
+/// 2. **按门禁服务过滤扫描**：只扫描广播门禁服务的设备，发现即连（不再被 9 台无关设备拖慢）
+/// 3. **双门禁服务支持**：`14839ac4-...` 与 `0734594a-...` 任一匹配即视为门禁
+/// 4. 过滤扫描无果时回退全量扫描，按"MAC 广播匹配优先 + 信号强弱"逐个尝试兜底
+///
+/// iOS 与 Android 的关键差异：iOS 不向 App 暴露外设真实 MAC 地址，无法像 Android
+/// 那样直接按 MAC 连接，因此靠缓存 + 服务过滤实现免选择、快速开门。
 final class UnlockManager: NSObject, ObservableObject {
 
     static let shared = UnlockManager()
 
-    /// 门禁 GATT 服务 UUID（与 Android 版一致）
-    static let magicServiceUUID = CBUUID(string: "14839ac4-7d7e-415c-9a42-167340cf2339")
+    /// 门禁 GATT 服务 UUID（两个候选，与 BaiyunKeys 小程序一致；Android 版为后者）
+    static let serviceUUIDs: [CBUUID] = [
+        CBUUID(string: "14839ac4-7d7e-415c-9a42-167340cf2339"),
+        CBUUID(string: "0734594a-a8e7-4b1a-a6b1-cd5243059a57")
+    ]
+
+    /// 缓存上次成功开门设备的系统 UUID
+    static let lastDeviceUUIDKey = "lastDeviceUUID"
 
     @Published var isScanning = false
     @Published var isAutoUnlocking = false
@@ -33,6 +43,15 @@ final class UnlockManager: NSObject, ObservableObject {
     private var autoQueue: [CBPeripheral] = []
     private var rssiMap: [UUID: Int] = [:]
     private var macCandidatesMap: [UUID: [String]] = [:]
+
+    /// 自动开门当前所处阶段
+    private enum AutoStage {
+        case cachedConnect // 直连缓存设备
+        case filteredScan  // 按门禁服务过滤扫描（发现即连）
+        case fullScan      // 全量扫描（MAC/信号兜底）
+        case tryingQueue   // 逐个尝试队列
+    }
+    private var autoStage: AutoStage = .cachedConnect
 
     override init() {
         super.init()
@@ -66,7 +85,7 @@ final class UnlockManager: NSObject, ObservableObject {
         log("扫描结束，共发现 \(devices.count) 个设备")
     }
 
-    /// 自动开门：扫描 → 按信号强弱逐个尝试 → 找到门禁服务自动开锁
+    /// 快速自动开门：缓存直连 → 服务过滤扫描 → 全量扫描兜底
     func autoUnlock(mac: String, key: String) {
         guard centralManager.state == .poweredOn else {
             message = "蓝牙未开启，请先在控制中心打开蓝牙"
@@ -87,33 +106,10 @@ final class UnlockManager: NSObject, ObservableObject {
         autoQueue = []
         rssiMap = [:]
         macCandidatesMap = [:]
-        log("开始自动开门：扫描附近蓝牙设备…")
+        log("开始自动开门…")
         isAutoUnlocking = true
-        isScanning = true
-        centralManager.scanForPeripherals(
-            withServices: nil,
-            options: [CBCentralManagerScanOptionAllowDuplicatesKey: false]
-        )
-        DispatchQueue.main.asyncAfter(deadline: .now() + 10) { [weak self] in
-            guard let self = self, self.isAutoUnlocking else { return }
-            self.stopScan()
-            // 优先尝试广播数据与所填 MAC 匹配的设备，其余按信号强弱排序
-            self.autoQueue = self.devices.sorted { a, b in
-                let aHit = self.macHit(for: a) ? 1 : 0
-                let bHit = self.macHit(for: b) ? 1 : 0
-                if aHit != bHit { return aHit > bHit }
-                return (self.rssiMap[a.identifier] ?? -100) > (self.rssiMap[b.identifier] ?? -100)
-            }
-            if self.autoQueue.isEmpty {
-                self.log("未扫描到任何蓝牙设备")
-                self.message = "未扫描到设备，请确认蓝牙已开，靠近门禁（1-2 米）后重试"
-                self.isAutoUnlocking = false
-                return
-            }
-            let matched = self.autoQueue.filter { self.macHit(for: $0) }.count
-            self.log("扫描到 \(self.autoQueue.count) 个设备，其中 MAC 匹配 \(matched) 个，开始自动识别门禁…")
-            self.tryNextDevice()
-        }
+        autoStage = .cachedConnect
+        tryCachedDevice()
     }
 
     /// 手动模式：连接指定设备并执行开锁流程
@@ -136,7 +132,7 @@ final class UnlockManager: NSObject, ObservableObject {
         log("开始连接 \(device.name ?? device.identifier.uuidString)…")
         centralManager.connect(device, options: nil)
 
-        // 10 秒超时自动断开（对应 Android 版逻辑）
+        // 10 秒超时自动断开
         let work = DispatchWorkItem { [weak self] in
             self?.log("10s 超时，自动断开连接")
             self?.cleanup()
@@ -145,7 +141,123 @@ final class UnlockManager: NSObject, ObservableObject {
         DispatchQueue.main.asyncAfter(deadline: .now() + 10, execute: work)
     }
 
-    // MARK: - 自动模式内部逻辑
+    // MARK: - 快速自动开门流程
+
+    /// 阶段一：直连上次成功开门的设备（最快，秒级）
+    private func tryCachedDevice() {
+        guard isAutoUnlocking else { return }
+        guard let uuidString = UserDefaults.standard.string(forKey: Self.lastDeviceUUIDKey),
+              let uuid = UUID(uuidString: uuidString) else {
+            startFilteredScan()
+            return
+        }
+        let cached = centralManager.retrievePeripherals(withIdentifiers: [uuid])
+        guard let device = cached.first else {
+            log("上次门禁不在附近，转为扫描")
+            startFilteredScan()
+            return
+        }
+        log("直连上次成功开门的设备…")
+        connectAndAttempt(device, timeout: 6)
+    }
+
+    /// 阶段二：按门禁服务过滤扫描，发现即连
+    private func startFilteredScan() {
+        guard isAutoUnlocking else { return }
+        autoStage = .filteredScan
+        devices = []
+        rssiMap = [:]
+        macCandidatesMap = [:]
+        log("按门禁服务过滤扫描…")
+        isScanning = true
+        centralManager.scanForPeripherals(
+            withServices: Self.serviceUUIDs,
+            options: [CBCentralManagerScanOptionAllowDuplicatesKey: false]
+        )
+        DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self] in
+            guard let self = self,
+                  self.isAutoUnlocking,
+                  self.autoStage == .filteredScan,
+                  self.peripheral == nil else { return }
+            self.log("过滤扫描未发现门禁，回退全量扫描…")
+            self.startFullScan()
+        }
+    }
+
+    /// 阶段三：全量扫描，MAC 广播匹配优先 + 信号强弱逐个尝试
+    private func startFullScan() {
+        guard isAutoUnlocking else { return }
+        autoStage = .fullScan
+        devices = []
+        rssiMap = [:]
+        macCandidatesMap = [:]
+        log("全量扫描附近蓝牙设备…")
+        isScanning = true
+        centralManager.scanForPeripherals(
+            withServices: nil,
+            options: [CBCentralManagerScanOptionAllowDuplicatesKey: false]
+        )
+        DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self] in
+            guard let self = self, self.isAutoUnlocking, self.autoStage == .fullScan else { return }
+            self.stopScan()
+            self.autoStage = .tryingQueue
+            // MAC 广播匹配的设备排最前，其余按信号强弱
+            self.autoQueue = self.devices.sorted { a, b in
+                let aHit = self.macHit(for: a) ? 1 : 0
+                let bHit = self.macHit(for: b) ? 1 : 0
+                if aHit != bHit { return aHit > bHit }
+                return (self.rssiMap[a.identifier] ?? -100) > (self.rssiMap[b.identifier] ?? -100)
+            }
+            if self.autoQueue.isEmpty {
+                self.log("未扫描到任何蓝牙设备")
+                self.message = "未扫描到设备，请确认蓝牙已开，靠近门禁（1-2 米）后重试"
+                self.isAutoUnlocking = false
+                return
+            }
+            let matched = self.autoQueue.filter { self.macHit(for: $0) }.count
+            self.log("扫描到 \(self.autoQueue.count) 个设备，MAC 匹配 \(matched) 个，逐个尝试…")
+            self.tryNextDevice()
+        }
+    }
+
+    /// 连接并进入开锁流程（阶段一/二直连共用）
+    private func connectAndAttempt(_ device: CBPeripheral, timeout: TimeInterval) {
+        peripheral = device
+        device.delegate = self
+        log("连接 \(device.name ?? "未知设备")…")
+        centralManager.connect(device, options: nil)
+
+        // 超时：断开连接，由 didDisconnect 触发进入下一阶段
+        let work = DispatchWorkItem { [weak self] in
+            guard let self = self, self.isAutoUnlocking else { return }
+            self.log("连接超时（\(Int(timeout))s）")
+            self.timeoutWork = nil
+            self.readableCharacteristic = nil
+            self.writeableCharacteristic = nil
+            if let p = self.peripheral {
+                self.centralManager.cancelPeripheralConnection(p)
+            }
+        }
+        timeoutWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + timeout, execute: work)
+    }
+
+    /// 当前直连失败后按阶段继续推进
+    private func continueAutoAfterFailure() {
+        peripheral = nil
+        readableCharacteristic = nil
+        writeableCharacteristic = nil
+        switch autoStage {
+        case .cachedConnect:
+            startFilteredScan()
+        case .filteredScan:
+            startFullScan()
+        case .tryingQueue:
+            tryNextDevice()
+        case .fullScan:
+            break
+        }
+    }
 
     /// 尝试队列中的下一个设备
     private func tryNextDevice() {
@@ -162,13 +274,13 @@ final class UnlockManager: NSObject, ObservableObject {
         log("尝试 \(device.name ?? "未知设备")…")
         centralManager.connect(device, options: nil)
 
-        // 每个设备 8 秒超时
+        // 每个设备 5 秒超时
         let work = DispatchWorkItem { [weak self] in
             self?.log("\(device.name ?? "设备") 连接超时，跳过")
             self?.cleanupForNext()
         }
         timeoutWork = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + 8, execute: work)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 5, execute: work)
     }
 
     /// 清理当前设备并继续尝试下一个（连接断开回调后会自动进入下一个）
@@ -194,43 +306,16 @@ final class UnlockManager: NSObject, ObservableObject {
         writeableCharacteristic = nil
     }
 
-    // MARK: - 日志
-
-    private func log(_ text: String) {
-        let formatter = DateFormatter()
-        formatter.dateFormat = "HH:mm:ss"
-        logs.append("[\(formatter.string(from: Date()))] \(text)")
-        if logs.count > 200 {
-            logs.removeFirst(logs.count - 200)
-        }
-    }
-
-    private func hex(_ bytes: [UInt8]) -> String {
-        bytes.map { String(format: "%02X", $0) }.joined(separator: " ")
-    }
-
-    /// 收到挑战值后加密并写回
-    private func handleChallenge(_ value: Data) {
-        let challenge = [UInt8](value)
-        log("收到挑战值（\(challenge.count) 字节）：\(hex(challenge))")
-        guard let writeCharacteristic = writeableCharacteristic,
-              let packet = LockBiz.encryptData(
-                  inputData: challenge,
-                  headerData: macBytes,
-                  keyString: keyString
-              ) else {
-            message = "加密失败，请检查 MAC / Key 是否正确"
-            finishAutoIfNeeded()
-            cleanup()
-            return
-        }
-        log("写入密钥报文：\(hex(packet))")
-        peripheral?.writeValue(Data(packet), for: writeCharacteristic, type: .withResponse)
+    /// 记录本次成功开门的设备，下次秒开
+    private func cacheLastDevice(_ device: CBPeripheral) {
+        UserDefaults.standard.set(device.identifier.uuidString, forKey: Self.lastDeviceUUIDKey)
+        log("已记住门禁设备，下次可直接秒开")
     }
 
     private func finishAutoIfNeeded() {
         isAutoUnlocking = false
         autoQueue = []
+        isScanning = false
     }
 
     // MARK: - MAC 识别（从广播数据解析候选 MAC）
@@ -284,6 +369,40 @@ final class UnlockManager: NSObject, ObservableObject {
         }
         return false
     }
+
+    // MARK: - 日志
+
+    private func log(_ text: String) {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "HH:mm:ss"
+        logs.append("[\(formatter.string(from: Date()))] \(text)")
+        if logs.count > 200 {
+            logs.removeFirst(logs.count - 200)
+        }
+    }
+
+    private func hex(_ bytes: [UInt8]) -> String {
+        bytes.map { String(format: "%02X", $0) }.joined(separator: " ")
+    }
+
+    /// 收到挑战值后加密并写回
+    private func handleChallenge(_ value: Data) {
+        let challenge = [UInt8](value)
+        log("收到挑战值（\(challenge.count) 字节）：\(hex(challenge))")
+        guard let writeCharacteristic = writeableCharacteristic,
+              let packet = LockBiz.encryptData(
+                  inputData: challenge,
+                  headerData: macBytes,
+                  keyString: keyString
+              ) else {
+            message = "加密失败，请检查 MAC / Key 是否正确"
+            finishAutoIfNeeded()
+            cleanup()
+            return
+        }
+        log("写入密钥报文：\(hex(packet))")
+        peripheral?.writeValue(Data(packet), for: writeCharacteristic, type: .withResponse)
+    }
 }
 
 // MARK: - CBCentralManagerDelegate
@@ -316,10 +435,19 @@ extension UnlockManager: CBCentralManagerDelegate {
         }
         rssiMap[peripheral.identifier] = RSSI.intValue
         macCandidatesMap[peripheral.identifier] = extractMacCandidates(from: advertisementData, peripheral: peripheral)
+
+        // 过滤扫描阶段：发现带门禁服务的设备，立即停止扫描并连接
+        if isAutoUnlocking && autoStage == .filteredScan {
+            central.stopScan()
+            isScanning = false
+            log("发现候选门禁设备 \(peripheral.name ?? "未知设备")，立即连接…")
+            connectAndAttempt(peripheral, timeout: 6)
+        }
     }
 
     func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
         timeoutWork?.cancel()
+        isScanning = false
         log("连接成功，开始搜索服务…")
         peripheral.discoverServices(nil)
     }
@@ -329,7 +457,7 @@ extension UnlockManager: CBCentralManagerDelegate {
                         error: Error?) {
         log("连接失败：\(error?.localizedDescription ?? "未知错误")")
         if isAutoUnlocking {
-            tryNextDevice()
+            continueAutoAfterFailure()
         } else {
             message = "连接门禁失败，请靠近门禁后重试"
             cleanup()
@@ -341,8 +469,14 @@ extension UnlockManager: CBCentralManagerDelegate {
                         error: Error?) {
         log("连接已断开")
         if isAutoUnlocking {
-            // 自动模式下：断开即尝试下一个设备
-            tryNextDevice()
+            self.peripheral = nil
+            readableCharacteristic = nil
+            writeableCharacteristic = nil
+            if autoStage == .tryingQueue {
+                tryNextDevice()
+            } else {
+                continueAutoAfterFailure()
+            }
         } else {
             cleanup()
         }
@@ -357,19 +491,25 @@ extension UnlockManager: CBPeripheralDelegate {
         if let error = error {
             log("搜索服务失败：\(error.localizedDescription)")
             if isAutoUnlocking {
-                cleanupForNext()
+                cleanup()
+                continueAutoAfterFailure()
             } else {
                 message = "未找到门禁服务"
                 cleanup()
             }
             return
         }
-        guard let service = peripheral.services?.first(where: { $0.uuid == Self.magicServiceUUID }) else {
+        guard let service = peripheral.services?.first(where: { Self.serviceUUIDs.contains($0.uuid) }) else {
             let found = (peripheral.services ?? []).map { $0.uuid.uuidString }.joined(separator: ", ")
             log("\(peripheral.name ?? "设备") 无门禁服务，可用服务：\(found)")
             if isAutoUnlocking {
-                log("跳过，尝试下一个设备…")
-                cleanupForNext()
+                if autoStage == .tryingQueue {
+                    log("跳过，尝试下一个设备…")
+                    cleanupForNext()
+                } else {
+                    cleanup()
+                    continueAutoAfterFailure()
+                }
             } else {
                 message = "未找到门禁服务，请确认选中的是门禁设备"
                 cleanup()
@@ -386,7 +526,8 @@ extension UnlockManager: CBPeripheralDelegate {
         if let error = error {
             log("查找特征失败：\(error.localizedDescription)")
             if isAutoUnlocking {
-                cleanupForNext()
+                cleanup()
+                continueAutoAfterFailure()
             } else {
                 cleanup()
             }
@@ -409,7 +550,7 @@ extension UnlockManager: CBPeripheralDelegate {
             }
         }
 
-        // 订阅通知（iOS 自动写 CCCD 描述符，等价于 Android 手动写描述符）
+        // 订阅通知（iOS 自动写 CCCD 描述符）
         for characteristic in notifyCharacteristics {
             peripheral.setNotifyValue(true, for: characteristic)
         }
@@ -455,6 +596,7 @@ extension UnlockManager: CBPeripheralDelegate {
         } else {
             log("密钥写入成功，门禁已触发开锁")
             message = "开门成功"
+            cacheLastDevice(peripheral)
         }
         finishAutoIfNeeded()
         cleanup()
