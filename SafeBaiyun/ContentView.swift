@@ -14,9 +14,9 @@ struct ContentView: View {
                     .foregroundColor(.secondary)
                     .frame(maxWidth: .infinity, alignment: .leading)
 
-                Button(action: { manager.scan() }) {
+                Button(action: { manager.autoUnlock(mac: mac, key: key) }) {
                     Label(
-                        manager.isScanning ? "正在扫描…" : "开门（扫描门禁）",
+                        manager.isAutoUnlocking ? "自动开门中…" : "开门（自动识别门禁）",
                         systemImage: "lock.open.fill"
                     )
                     .font(.title3)
@@ -24,13 +24,17 @@ struct ContentView: View {
                     .padding(.vertical, 14)
                 }
                 .buttonStyle(.borderedProminent)
-                .disabled(manager.isScanning || mac.isEmpty || key.isEmpty)
+                .disabled(manager.isAutoUnlocking || mac.isEmpty || key.isEmpty)
 
-                if manager.isScanning {
-                    ProgressView("扫描中，请靠近门禁…")
+                if manager.isAutoUnlocking {
+                    ProgressView("自动开门中：扫描并识别门禁…")
                 }
 
                 if !manager.devices.isEmpty {
+                    Text("扫描到的设备（自动识别失败时可手动点选）")
+                        .font(.footnote)
+                        .foregroundColor(.secondary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
                     List(manager.devices, id: \.identifier) { device in
                         Button {
                             manager.unlock(device: device, mac: mac, key: key)
